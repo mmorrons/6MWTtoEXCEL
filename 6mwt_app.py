@@ -5,7 +5,7 @@ import openpyxl
 import streamlit as st
 import io
 
-# --- Your existing functions (modified if needed) ---
+# --- Updated functions ---
 
 def process_file(file_path_or_buffer):
     ns = {'ss': 'urn:schemas-microsoft-com:office:spreadsheet'}
@@ -46,7 +46,8 @@ def process_file(file_path_or_buffer):
     if marker_index is None:
         raise ValueError("START marker not found.")
 
-    # --- Collect boundary markers ---
+    # --- Collect boundary markers and meter readings ---
+    # We expect boundaries: START (assumed meter=0) and then 6 numeric values.
     boundaries = []
     for idx, row in enumerate(rows):
         cells = row.findall("ss:Cell", ns)
@@ -54,21 +55,42 @@ def process_file(file_path_or_buffer):
             marker_cell = cells[marker_index].find("ss:Data", ns)
             if marker_cell is not None and marker_cell.text and marker_cell.text.strip():
                 marker_text = marker_cell.text.strip().upper()
-                if marker_text == "START" or marker_text.startswith("MINUTO") or marker_text == "STOP":
-                    time_val = ""
-                    if marker_index - 2 >= 0 and marker_index - 2 < len(cells):
-                        time_cell = cells[marker_index - 2].find("ss:Data", ns)
-                        if time_cell is not None and time_cell.text:
-                            time_val = time_cell.text.strip()
-                    boundaries.append({"row_index": idx, "time": time_val})
-    if len(boundaries) < 2:
-        raise ValueError("Not enough boundary markers found.")
-
+                # Get the time from 2 cells before the marker (as before)
+                time_val = ""
+                if marker_index - 2 >= 0 and marker_index - 2 < len(cells):
+                    time_cell = cells[marker_index - 2].find("ss:Data", ns)
+                    if time_cell is not None and time_cell.text:
+                        time_val = time_cell.text.strip()
+                meter_val = None
+                if marker_text == "START":
+                    meter_val = 0.0
+                else:
+                    # Try to convert the marker text to a float.
+                    try:
+                        meter_val = float(marker_text.replace(',', '.'))
+                    except:
+                        # If marker_text is STOP or non-numeric, skip it.
+                        if marker_text == "STOP":
+                            continue
+                        else:
+                            continue
+                boundaries.append({"row_index": idx, "time": time_val, "meter": meter_val})
     if len(boundaries) < 7:
-        raise ValueError("Expected at least 7 boundary markers (START, MINUTO 1...MINUTO 6).")
+        raise ValueError("Not enough boundary markers found (expected at least 7).")
+    
+    # Take only the first 7 boundaries (START and 6 minutes)
+    boundaries = boundaries[:7]
+    boundaries_times = [b["time"] for b in boundaries]
+    meters = [b["meter"] for b in boundaries]
 
-    # --- Compute per-minute averages ---
-    num_metrics = 18
+    # --- Process physiological metrics (if needed later) ---
+    # Now we have 17 metrics (columns 4 to 20, index 3 to 19)
+    num_metrics = 17
+    # Update var_names to match the new XML columns
+    var_names = ["V'O2", "V'O2/kg", "V'E", "RER", "FC", "CHO", "FAT",
+                 "EE", "EECHO", "EEFAT", "METS", "V'CO2", "V'E/V'CO2", "BF", "EE/BSA", "EE/kg", "EE/kg/magra"]
+
+    # Compute per-minute averages (over the 6 intervals)
     per_minute_avgs = []
     for interval in range(6):
         start_idx = boundaries[interval]["row_index"]
@@ -95,44 +117,37 @@ def process_file(file_path_or_buffer):
             avg_metrics.append(sum_metrics[k] / count_metrics[k] if count_metrics[k] > 0 else None)
         per_minute_avgs.append(avg_metrics)
 
-    # --- Build per-metric lists ---
-    variables = []
-    for k in range(num_metrics):
-        vals = []
-        for m in range(6):
-            vals.append(per_minute_avgs[m][k])
-        variables.append(vals)
-
-    def avg_list(vals):
-        valid = [v for v in vals if v is not None]
-        return sum(valid)/len(valid) if valid else None
-
+    # (The rest of the physiological variable aggregation remains available if needed.)
     aggregates = []
-    for vals in variables:
+    for col in range(num_metrics):
+        vals = [per_minute_avgs[m][col] for m in range(6)]
+        valid = [v for v in vals if v is not None]
+        avg_val = sum(valid)/len(valid) if valid else None
         aggregates.append({
-            "third1": avg_list(vals[0:2]),
-            "third2": avg_list(vals[2:4]),
-            "third3": avg_list(vals[4:6]),
-            "half1": avg_list(vals[0:3]),
-            "half2": avg_list(vals[3:6]),
-            "total": avg_list(vals[0:6])
+            "third1": sum(vals[0:2])/2 if len(vals[0:2])==2 else None,
+            "third2": sum(vals[2:4])/2 if len(vals[2:4])==2 else None,
+            "third3": sum(vals[4:6])/2 if len(vals[4:6])==2 else None,
+            "half1": sum(vals[0:3])/3 if len(vals[0:3])==3 else None,
+            "half2": sum(vals[3:6])/3 if len(vals[3:6])==3 else None,
+            "total": avg_val
         })
 
-    var_names = ["V'O2", "V'CO2", "V'O2/kg", "VCO2kg", "V'E", "RER", "FC", "CHO", "FAT",
-                 "EE", "EECHO", "EEFAT", "METS", "Borg", "BF", "WR", "V'E/V'O2", "V'E/V'CO2"]
-    boundaries_times = [boundaries[i]["time"] for i in range(7)]
-    subject_data = {"surname": surname, "name": name, "boundaries": boundaries_times, "variables": {}}
+    subject_data = {
+        "surname": surname,
+        "name": name,
+        "boundaries": boundaries_times,
+        "meters": meters,  # list of meter values from boundaries (length 7)
+        "variables": {}
+    }
     for idx, var in enumerate(var_names):
         var_data = {}
         for m in range(1, 7):
-            var_data[f"{var}_{m}"] = variables[idx][m-1]
+            var_data[f"{var}_{m}"] = per_minute_avgs[m-1][idx] if m-1 < len(per_minute_avgs) else None
         for suffix in ["third1", "third2", "third3", "half1", "half2", "total"]:
             var_data[f"{var}_{suffix}"] = aggregates[idx][suffix]
         subject_data["variables"][var] = var_data
 
     return subject_data
-
-# --- Streamlit Interface ---
 
 def main():
     st.title("6MWT Data Extraction")
@@ -152,12 +167,10 @@ def main():
                 st.error(f"Error processing {uploaded_file.name}: {e}")
 
         if all_subjects:
-            # Optionally, show one subject's data or provide a download button for the Excel file.
             st.write("Extracted Data:")
             st.json(all_subjects)
 
             # --- Generate and Download Excel File ---
-            import openpyxl
             from openpyxl import Workbook
             from io import BytesIO
 
@@ -166,27 +179,77 @@ def main():
             ws.title = "6MWT Data"
 
             # Build header:
+            # First, boundaries (time) columns (7 edges)
             headers = [f"Edge_{i}" for i in range(1, 8)]
-            headers.extend(["Surname", "Name"])
-            var_names = ["V'O2", "V'CO2", "V'O2/kg", "VCO2kg", "V'E", "RER", "FC", "CHO", "FAT",
-                         "EE", "EECHO", "EEFAT", "METS", "Borg", "BF", "WR", "V'E/V'O2", "V'E/V'CO2"]
-            for var in var_names:
-                for m in range(1, 7):
-                    headers.append(f"{var}_{m}")
-                for suffix in ["third1", "third2", "third3", "half1", "half2", "total"]:
-                    headers.append(f"{var}_{suffix}")
+            # Then Surname, Name and an empty ID column
+            headers.extend(["Surname", "Name", "ID"])
+            # Then the distance and speed columns:
+            distance_cols = [
+                "SixMWT_m_1", "SixMWT_m_2", "SixMWT_m_3", "SixMWT_m_4", "SixMWT_m_5", "SixMWT_m_6",
+                "SixMWT_m_first2", "SixMWT_m_second2", "SixMWT_m_third2",
+                "SixMWT_m_first3", "SixMWT_m_last3", "SixMWT_m_tot",
+                "SixMWT_km_h_tot", "TwoMWT_m_tot", "TwoMWT_km_h_tot",
+                "DWI_6-2", "DWI_6-3", "DWI_6-1"
+            ]
+            headers.extend(distance_cols)
             ws.append(headers)
 
             for subj in all_subjects:
                 row = []
+                # Boundaries times:
                 row.extend(subj["boundaries"])
-                row.extend([subj["surname"], subj["name"]])
-                for var in var_names:
-                    var_data = subj["variables"].get(var, {})
-                    for m in range(1, 7):
-                        row.append(var_data.get(f"{var}_{m}"))
-                    for suffix in ["third1", "third2", "third3", "half1", "half2", "total"]:
-                        row.append(var_data.get(f"{var}_{suffix}"))
+                # Surname, Name, and empty ID:
+                row.extend([subj["surname"], subj["name"], ""])
+                # Compute distance/speed metrics using the meter boundaries.
+                # Expecting exactly 7 meter values: m0, m1, ..., m6
+                m = subj["meters"]
+                if len(m) < 7:
+                    # Fill with Nones if not enough boundaries
+                    m = m + [None]*(7-len(m))
+                m0, m1, m2, m3, m4, m5, m6 = m[:7]
+                # Compute per-minute distances (handle None if any)
+                def diff(a, b):
+                    return (b - a) if (a is not None and b is not None) else None
+
+                SixMWT_m_1 = diff(m0, m1)
+                SixMWT_m_2 = diff(m1, m2)
+                SixMWT_m_3 = diff(m2, m3)
+                SixMWT_m_4 = diff(m3, m4)
+                SixMWT_m_5 = diff(m4, m5)
+                SixMWT_m_6 = diff(m5, m6)
+                SixMWT_m_first2 = diff(m0, m2)
+                SixMWT_m_second2 = diff(m2, m4)
+                SixMWT_m_third2 = diff(m4, m6)
+                SixMWT_m_first3 = diff(m0, m3)
+                SixMWT_m_last3 = diff(m3, m6)
+                SixMWT_m_tot = diff(m0, m6)
+                # Speed calculations:
+                # Total 6 minutes: time = 6/60 = 0.1 hour, so km/h = (distance in km)/0.1 = distance/1000/0.1 = distance/100
+                SixMWT_km_h_tot = (SixMWT_m_tot / 100) if SixMWT_m_tot is not None else None
+                # Two minutes: time = 2/60 hour, so km/h = (distance/1000) / (2/60) = (distance*30)/1000
+                TwoMWT_m_tot = SixMWT_m_first2  # distance from m0 to m2
+                TwoMWT_km_h_tot = (TwoMWT_m_tot * 30 / 1000) if TwoMWT_m_tot is not None else None
+
+                # Percentage differences (if denominators are nonzero)
+                def perc_diff(x, y):
+                    # returns ((y - x) / x)*100, comparing minute y to minute x
+                    if x not in (None, 0) and y is not None:
+                        return ((y - x) / x) * 100
+                    else:
+                        return None
+
+                DWI_6_2 = perc_diff(SixMWT_m_2, SixMWT_m_6)
+                DWI_6_3 = perc_diff(SixMWT_m_3, SixMWT_m_6)
+                DWI_6_1 = perc_diff(SixMWT_m_1, SixMWT_m_6)
+
+                computed = [
+                    SixMWT_m_1, SixMWT_m_2, SixMWT_m_3, SixMWT_m_4, SixMWT_m_5, SixMWT_m_6,
+                    SixMWT_m_first2, SixMWT_m_second2, SixMWT_m_third2,
+                    SixMWT_m_first3, SixMWT_m_last3, SixMWT_m_tot,
+                    SixMWT_km_h_tot, TwoMWT_m_tot, TwoMWT_km_h_tot,
+                    DWI_6_2, DWI_6_3, DWI_6_1
+                ]
+                row.extend(computed)
                 ws.append(row)
 
             # Save workbook to a BytesIO stream
