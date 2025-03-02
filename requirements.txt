@@ -1,6 +1,2 @@
 streamlit
 openpyxl
-os
-re
-xml.etree.ElementTree
-io
